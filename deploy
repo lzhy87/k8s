@@ -1,0 +1,621 @@
+#下载docker
+#curl -fsSL https://get.docker.com | bash -s docker --mirror Aliyun
+yum install -y yum-utils \
+device-mapper-persistent-data \
+lvm2
+
+yum-config-manager \
+--add-repo \
+https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+
+yum install -y docker-ce-18.09.8-3.el7 docker-ce-cli containerd.io
+#加速器
+ sudo mkdir -p /etc/docker
+ sudo tee /etc/docker/daemon.json <<-'EOF'
+{
+  "registry-mirrors": ["https://iuj3d0uh.mirror.aliyuncs.com"],
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+  "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+
+systemctl daemon-reload
+systemctl enable docker
+systemctl restart docker
+
+
+#下载安装k8s、及ipvsadm(node端也需要装)
+yum install -y ipvsadm ipset
+
+# 加载内核模块 <module_name>
+cat > /etc/sysconfig/modules/ipvs.modules << EOF
+#!/bin/bash
+modprobe -- ip_vs
+modprobe -- ip_vs_rr
+modprobe -- ip_vs_wrr
+modprobe -- ip_vs_sh
+modprobe -- nf_conntrack_ipv4
+EOF
+chmod 755 /etc/sysconfig/modules/ipvs.modules && bash /etc/sysconfig/modules/ipvs.modules && lsmod | grep -e ip_vs -e nf_conntrack_ipv4
+
+cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+EOF
+setenforce 0
+yum install -y kubelet kubeadm kubectl
+systemctl enable kubelet && systemctl start kubelet
+
+
+#修改系统参数(记得删除/etc/fatab里面的swap加载选项，不然开机后会启不动的！！！)
+swapoff -a
+cat <<EOF >  /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+vm.swappiness = 0
+EOF
+sysctl --system
+
+
+
+#pull k8s需要的相关镜像
+kubeadm config images list |sed -e 's/^/docker pull /g' -e 's#k8s.gcr.io#docker.io/mirrorgooglecontainers#g' |sh -x
+docker images |grep mirrorgooglecontainers |awk '{print "docker tag ",$1":"$2,$1":"$2}' |sed -e 's#mirrorgooglecontainers#k8s.gcr.io#2' |sh -x
+docker pull coredns/coredns:1.3.1
+docker tag coredns/coredns:1.3.1 k8s.gcr.io/coredns:1.3.1
+
+
+
+
+#node端需要安装
+docker pull mirrorgooglecontainers/kube-proxy:v1.15.3
+docker tag mirrorgooglecontainers/kube-proxy:v1.15.3 k8s.gcr.io/kube-proxy:v1.15.3
+docker pull mirrorgooglecontainers/pause:3.1
+docker tag mirrorgooglecontainers/pause:3.1 k8s.gcr.io/pause:3.1
+
+#配置初始化kubeadm-config.yaml
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+mode: "ipvs"
+---
+apiVersion: kubeadm.k8s.io/v1beta1
+kind: ClusterConfiguration
+kubernetesVersion: v1.15.3
+apiServer:
+    certSANs:
+      - apiserver.bitqq.vip
+      - 192.168.0.12
+      - 192.168.0.13
+      - 192.168.0.14
+      - 192.168.0.15
+    extraArgs:
+        allow-privileged: "true"
+        feature-gates: "VolumeSnapshotDataSource=true,CSINodeInfo=true,CSIDriverRegistry=true"
+controlPlaneEndpoint: "192.168.0.66:7443"
+etcd:
+    local:
+        dataDir: /data/etcd
+networking:
+    podSubnet: "10.244.0.0/16"
+controllerManager:
+    extraArgs:
+        address: 0.0.0.0
+scheduler:
+    extraArgs:
+        address: 0.0.0.0
+imageRepository: registry.aliyuncs.com/google_containers
+
+
+#vim /etc/hosts
+172.16.1.182 k8s-m001
+172.16.1.181 k8s-m002
+172.16.1.180 k8s-m003
+172.16.1.184 k8s-s001
+172.16.1.183 k8s-s002
+172.16.1.185 k8s-s003
+
+#初始化k8s（单点k8s)
+#kubeadm init --kubernetes-version=v1.15.3 --pod-network-cidr=10.244.0.0/16 --service-cidr=10.96.0.0/12  --image-repository registry.aliyuncs.com/google_containers
+##ha高可用集群
+kubeadm init --config=kubeadm-config.yaml
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+
+
+#master上安装Canal插件
+kubectl apply -f https://docs.projectcalico.org/v3.3/getting-started/kubernetes/installation/hosted/canal/rbac.yaml
+kubectl apply -f https://docs.projectcalico.org/v3.3/getting-started/kubernetes/installation/hosted/canal/canal.yaml
+
+############################################################以上是安装单节点k8s.master#####################################################################################
+#复制证书到其他2个master节点上
+USER=root
+CONTROL_PLANE_IPS="172.16.1.181 172.16.1.180"
+for host in ${CONTROL_PLANE_IPS}; do
+    scp  /etc/kubernetes/pki/ca.crt "${USER}"@$host:
+    scp  /etc/kubernetes/pki/ca.key "${USER}"@$host:
+    scp  /etc/kubernetes/pki/sa.key "${USER}"@$host:
+    scp  /etc/kubernetes/pki/sa.pub "${USER}"@$host:
+    scp  /etc/kubernetes/pki/front-proxy-ca.crt "${USER}"@$host:
+    scp  /etc/kubernetes/pki/front-proxy-ca.key "${USER}"@$host:
+    scp  /etc/kubernetes/pki/etcd/ca.crt "${USER}"@$host:etcd-ca.crt
+    scp  /etc/kubernetes/pki/etcd/ca.key "${USER}"@$host:etcd-ca.key
+    scp  /etc/kubernetes/admin.conf "${USER}"@$host:
+done
+#登录第二、三个控制节点移动证书到正确位置
+USER=root
+mkdir -p /etc/kubernetes/pki/etcd
+mv /${USER}/ca.crt /etc/kubernetes/pki/
+mv /${USER}/ca.key /etc/kubernetes/pki/
+mv /${USER}/sa.pub /etc/kubernetes/pki/
+mv /${USER}/sa.key /etc/kubernetes/pki/
+mv /${USER}/front-proxy-ca.crt /etc/kubernetes/pki/
+mv /${USER}/front-proxy-ca.key /etc/kubernetes/pki/
+mv /${USER}/etcd-ca.crt /etc/kubernetes/pki/etcd/ca.crt
+mv /${USER}/etcd-ca.key /etc/kubernetes/pki/etcd/ca.key
+mv /${USER}/admin.conf /etc/kubernetes/admin.conf
+
+#将第二、三个控制节点加入集群
+  kubeadm join 192.168.0.12:6443 --token dyo5lo.myr146qdu45c6po8 \
+    --discovery-token-ca-cert-hash sha256:13ed1248c73e2e2987afdc73685f5451f5b361d9c3973fde35754d846f184c34 \
+    --control-plane
+#将从节点加入集群
+kubeadm join 192.168.0.12:6443 --token dyo5lo.myr146qdu45c6po8 \
+    --discovery-token-ca-cert-hash sha256:13ed1248c73e2e2987afdc73685f5451f5b361d9c3973fde35754d846f184c34
+#############################################################################################################
+#配置 HaProxy 作为 apiserver 的负载均衡
+#三个 Kubernetes 控制节点编译安装 Haproxy
+#安装编译所需软件包
+
+yum install gcc pcre-static pcre-devel systemd-devel -y
+#下载 haproxy
+
+wget https://www.haproxy.org/download/1.8/src/haproxy-1.8.13.tar.gz
+#编译安装
+
+tar xzvf haproxy-1.8.13.tar.gz
+cd haproxy-1.8.13
+make TARGET=linux2628 USE_SYSTEMD=1
+make install
+mkdir -p /etc/haproxy
+mkdir -p /var/lib/haproxy
+#配置 haproxy 服务启动配置文件
+
+vi /usr/lib/systemd/system/haproxy.service
+[Unit]
+Description=HAProxy Load Balancer
+After=network.target
+
+[Service]
+Environment="CONFIG=/etc/haproxy/haproxy.cfg" "PIDFILE=/run/haproxy.pid"
+ExecStartPre=/usr/local/sbin/haproxy -f $CONFIG -c -q
+ExecStart=/usr/local/sbin/haproxy -Ws -f $CONFIG -p $PIDFILE
+ExecReload=/usr/local/sbin/haproxy -f $CONFIG -c -q
+ExecReload=/bin/kill -USR2 $MAINPID
+KillMode=mixed
+Restart=always
+SuccessExitStatus=143
+Type=notify
+
+# The following lines leverage SystemD's sandboxing options to provide
+# defense in depth protection at the expense of restricting some flexibility
+# in your setup (e.g. placement of your configuration files) or possibly
+# reduced performance. See systemd.service(5) and systemd.exec(5) for further
+# information.
+
+# NoNewPrivileges=true
+# ProtectHome=true
+# If you want to use 'ProtectSystem=strict' you should whitelist the PIDFILE,
+# any state files and any other files written using 'ReadWritePaths' or
+# 'RuntimeDirectory'.
+# ProtectSystem=true
+# ProtectKernelTunables=true
+# ProtectKernelModules=true
+# ProtectControlGroups=true
+# If your SystemD version supports them, you can add: @reboot, @swap, @sync
+# SystemCallFilter=~@cpu-emulation @keyring @module @obsolete @raw-io
+
+[Install]
+WantedBy=multi-user.target
+
+#配置 haproxy
+
+vi /etc/haproxy/haproxy.cfg
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    chroot /var/lib/haproxy
+    stats timeout 30s
+    maxconn 5000
+    daemon
+
+defaults
+    log global
+    mode http
+    option dontlognull
+    timeout connect 5000
+    timeout client 50000
+    timeout server 50000
+
+frontend k8s-api
+    bind 0.0.0.0:7443
+    mode tcp
+    default_exchange-qqb k8s-api
+
+exchange-qqb k8s-api
+    mode tcp
+    option tcp-check
+    balance roundrobin
+    default-server inter 10s downinter 5s rise 2 fall 2 slowstart 60s maxconn 250 maxqueue 256 weight 100
+    server k8s-api-1 192.168.0.13:6443 check
+    server k8s-api-2 192.168.0.14:6443 check
+    server k8s-api-3 192.168.0.15:6443 check
+#启动 HaProxy 并设置开机自启动
+
+systemctl start haproxy
+systemctl enable haproxy
+#配置 keepalived 服务
+#安装 keepalived
+
+yum install -y keepalived psmisc
+#节点1上配置
+
+vi /etc/keepalived/keepalived.conf
+global_defs {
+notification_email {
+    root@localhost
+}
+notification_email_from admin@allen.com
+smtp_server 127.0.0.1
+smtp_connect_timeout 30
+router_id LVS_ALLEN
+}
+vrrp_script haproxy-check {
+    script "killall -0 haproxy"
+    interval 2
+    weight -30
+}
+vrrp_instance k8s-api {
+    state MASTER
+    interface eth0
+    virtual_router_id 100
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass k8s
+    }
+    virtual_ipaddress {
+        192.168.0.66
+    }
+    track_script {
+        haproxy-check
+    }
+}
+#节点2上配置：
+
+vi /etc/keepalived/keepalived.conf
+global_defs {
+notification_email {
+    root@localhost
+}
+notification_email_from admin@allen.com
+smtp_server 127.0.0.1
+smtp_connect_timeout 30
+router_id LVS_ALLEN
+}
+vrrp_script haproxy-check {
+    script "killall -0 haproxy"
+    interval 2
+    weight -30
+}
+vrrp_instance k8s-api {
+    state BACKUP
+    interface eth0
+    virtual_router_id 100
+    priority 90
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass k8s
+    }
+    virtual_ipaddress {
+        192.168.0.66
+    }
+    track_script {
+        haproxy-check
+    }
+}
+#节点3上配置：
+
+vi /etc/keepalived/keepalived.conf
+global_defs {
+notification_email {
+    root@localhost
+}
+notification_email_from admin@allen.com
+smtp_server 127.0.0.1
+smtp_connect_timeout 30
+router_id LVS_ALLEN
+}
+vrrp_script haproxy-check {
+    script "killall -0 haproxy"
+    interval 2
+    weight -30
+}
+vrrp_instance k8s-api {
+    state BACKUP
+    interface eth0
+    virtual_router_id 100
+    priority 80
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass k8s
+    }
+    virtual_ipaddress {
+        192.168.0.66
+    }
+    track_script {
+        haproxy-check
+    }
+}
+各节点启动 keepalived
+
+systemctl start keepalived
+systemctl enable keepalived
+
+
+#######################################################################################################
+#安装helm
+wget https://get.helm.sh/helm-v2.14.3-linux-amd64.tar.gz
+tar -zxvf helm-v2.14.3-linux-amd64.tar.gz # 解压压缩包
+# 把 helm 指令放到bin目录下
+mv linux-amd64/helm /usr/local/bin/helm
+helm help # 验证
+
+#改变helm拉去镜像的源
+helm init --stable-repo-url https://aliacs-app-catalog.oss-cn-hangzhou.aliyuncs.com/charts/ #helm 3 初始化
+helm init --client-only --stable-repo-url https://aliacs-app-catalog.oss-cn-hangzhou.aliyuncs.com/charts/ #helm 2 初始化
+helm repo add incubator https://aliacs-app-catalog.oss-cn-hangzhou.aliyuncs.com/charts-incubator/
+helm repo add apphub https://apphub.aliyuncs.com
+helm repo update
+
+
+# 创建服务端
+helm version
+# tiller版本要和helm version查看到的一致
+helm init --service-account tiller --upgrade -i registry.cn-hangzhou.aliyuncs.com/google_containers/tiller:v2.14.3  --stable-repo-url https://kubernetes.oss-cn-hangzhou.aliyuncs.com/charts
+ 
+# 创建TLS认证服务端，参考地址：https://github.com/gjmzj/kubeasz/blob/master/docs/guide/helm.md
+helm init --service-account tiller --upgrade -i registry.cn-hangzhou.aliyuncs.com/google_containers/tiller:v2.14.3 --tiller-tls-cert /etc/kubernetes/ssl/tiller001.pem --tiller-tls-key /etc/kubernetes/ssl/tiller001-key.pem --tls-ca-cert /etc/kubernetes/ssl/ca.pem --tiller-namespace kube-system --stable-repo-url https://kubernetes.oss-cn-hangzhou.aliyuncs.com/charts
+
+
+#创建 Kubernetes 的服务帐号和绑定角色
+kubectl create serviceaccount --namespace kube-system tiller
+kubectl create clusterrolebinding tiller-cluster-rule --clusterrole=cluster-admin --serviceaccount=kube-system:tiller
+
+
+# 使用 kubectl patch 更新 API 对象
+kubectl patch deploy --namespace kube-system tiller-deploy -p '{"spec":{"template":{"spec":{"serviceAccount":"tiller"}}}}'
+
+# 查看是否授权成功
+kubectl get deploy --namespace kube-system   tiller-deploy  --output yaml|grep  serviceAccount
+
+#验证是否安装成功
+kubectl -n kube-system get pods|grep tiller
+helm version
+
+##更换helm仓库
+# 先移除原先的仓库
+helm repo remove stable
+# 添加新的仓库地址
+helm repo add stable https://kubernetes.oss-cn-hangzhou.aliyuncs.com/charts
+# 更新仓库
+helm repo update
+
+
+##################################################################################################################
+##安装kubectl提示
+yum install bash-completion* -y
+kubectl completion bash > ~/.kube/completion.bash.inc
+source $HOME/.kube/completion.bash.inc
+
+##需要安装traefik-ingress-controller的节点上打上标记
+kubectl label  node <node_name> traefik=proxy
+kubectl label  node <node_name> traefik=proxy
+kubectl get nodes --show-labels
+
+##安装traefik-rbac.yaml
+
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: traefik-ingress-controller
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - services
+      - endpoints
+      - secrets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - extensions
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: traefik-ingress-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: traefik-ingress-controller
+subjects:
+- kind: ServiceAccount
+  name: traefik-ingress-controller
+  namespace: kube-system
+---
+
+ ##安装traefik-deploy
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traefik-ingress-controller
+  namespace: kube-system
+---
+kind: DaemonSet
+apiVersion: extensions/v1beta1
+metadata:
+  name: traefik-ingress-controller
+  namespace: kube-system
+  labels:
+    k8s-app: traefik-ingress-lb
+spec:
+#  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: traefik-ingress-lb
+  template:
+    metadata:
+      labels:
+        k8s-app: traefik-ingress-lb
+        name: traefik-ingress-lb
+    spec:
+      nodeSelector: 
+        traefik: proxy
+      hostNetwork: true
+      serviceAccountName: traefik-ingress-controller
+      terminationGracePeriodSeconds: 60
+      containers:
+      - image: traefik
+        name: traefik-ingress-lb
+        ports:
+        - name: http
+          containerPort: 80
+        - name: admin
+          containerPort: 8080
+        args:
+        - --api
+        - --kubernetes
+        - --logLevel=INFO
+        - --defaultentrypoints=http,https
+        - --entrypoints=Name:https Address::443 TLS
+        - --entrypoints=Name:http Address::80
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: traefik-ingress-service
+  namespace: kube-system
+spec:
+  selector:
+    k8s-app: traefik-ingress-lb
+  ports:
+    - protocol: TCP
+      port: 80
+      name: web
+    - protocol: TCP
+      port: 8080
+      name: admin
+  type: NodePort
+
+##############################################操作dashbord#######################################################
+#1、先把服务映射到本地(默认8001端口)
+kubectl proxy
+#2、进入网址：
+http://localhost:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/
+##################################################升级k8s##########################################################
+#1、首先升级kubelet、kubeadm、kubectl，再升级下载相关新的镜像：
+##增加阿里云源
+cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+[kubernetes]
+name=Kubernetes
+baseurl=https://mirrors.aliyun.com/kubernetes/yum/repos/kubernetes-el7-x86_64/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://mirrors.aliyun.com/kubernetes/yum/doc/yum-key.gpg https://mirrors.aliyun.com/kubernetes/yum/doc/rpm-package-key.gpg
+EOF
+#查看相关版本
+yum list --showduplicates kubeadm --disableexcludes=kubernetes
+##安装指定版本
+yum install -y kubeadm-1.15.6-0 kubelet-1.15.6-0 kubectl-1.15.6-0 --disableexcludes=kubernetes
+
+kubeadm config images list |sed -e 's/^/docker pull /g' -e 's#k8s.gcr.io#registry.cn-hangzhou.aliyuncs.com/google_containers#g' |sh -x
+docker images |grep google_containers |awk '{print "docker tag ",$1":"$2,$1":"$2}' |sed -e 's#registry.cn-hangzhou.aliyuncs.com/google_containers#k8s.gcr.io#2' |sh -x
+
+
+
+#2、查看升级计划
+kubeadm upgrade plan
+#3、开始升级k8s升级控制平面
+kubeadm upgrade apply v1.15.6
+#4、重启kubelet服务
+systemctl daemon-reload && systemctl restart kubelet
+
+#5、升级node节点(驱逐node1节点pod，注意：可以不用驱逐)
+kubectl drain node1 --ignore-daemonsets --force
+#6、升级node节点，首先升级下载相关新的镜像，再升级kubelet、kubeadm、kubectl软件包
+yum install -y kubeadm-1.15.6-0 kubelet-1.15.6-0 kubectl-1.15.6-0 --disableexcludes=kubernetes
+docker pull registry.cn-hangzhou.aliyuncs.com/google_containers/kube-proxy:v1.15.6
+docker tag registry.cn-hangzhou.aliyuncs.com/google_containers/kube-proxy:v1.15.6 k8s.gcr.io/kube-proxy:v1.15.6
+docker pull registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.1
+docker tag registry.cn-hangzhou.aliyuncs.com/google_containers/pause:3.1 k8s.gcr.io/pause:3.1
+
+#7、升级node节点，升级控制平面
+kubeadm upgrade node --kubelet-version v1.15.6
+#8、升级node节点，重启kubelet服务
+systemctl daemon-reload && systemctl restart kubelet
+
+#9、将node节点设置成可以调度的
+kubectl uncordon node1
+
+
+#################################证书更新#################################
+kubeadm alpha certs check-expiration  #查看证书有效期
+kubeadm alpha certs renew all #更新所有证书
+
+
+###################日常管理命令#########################
+#########k8s节点role打标签#########################
+###添加label
+kubectl label nodes k8s-m001 node-role.kubernetes.io/master=
+kubectl label nodes k8s-s001 node-role.kubernetes.io/worker=
+##删除label
+kubectl label nodes k8s-m001 node-role.kubernetes.io/master-
+kubectl label nodes k8s-s001 node-role.kubernetes.io/worker-
+
+####################查找以什么开头的deployments，并关闭。用于批量关闭POD###########
+kubectl scale deploy $(kubectl get deployments.apps -n exchange-qqb|grep -v NAME|awk '{print $1}') --replicas=0 -n exchange-qqb
+kubectl delete configmap $(kubectl get configmap -n exchange-qqb|grep -i py |grep -v NAME|awk '{print $1}')  -n exchange-qqb
+
+##删除Terminating的命名空间
+ kubectl get namespace cattle-global-data -o json > tmp.json
+ vim tmp.json #删除spec字段下面的信息
+ kubectl proxy --port=8081 &
+ curl -k -H "Content-Type: application/json" -X PUT --data-binary @tmp.json http://127.0.0.1:8081/api/v1/namespaces/cattle-global-data/finalize
+##删除Terminating的PV\PVC
+kubectl patch pvc xxx -p '{"metadata":{"finalizers":null}}'
+##删除Terminating的POD
+kubectl delete pod [pod name] --force --grace-period=0 -n [namespace]
